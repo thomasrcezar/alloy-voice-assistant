@@ -1,10 +1,11 @@
 import base64
 from threading import Lock, Thread
-
-import cv2
 from langchain_google_genai import ChatGoogleGenerativeAI
+import numpy as np
+import cv2
 import openai
-from cv2 import VideoCapture, imencode
+from mss import mss
+from cv2 import imencode
 from dotenv import load_dotenv
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.schema.messages import SystemMessage
@@ -18,35 +19,38 @@ from speech_recognition import Microphone, Recognizer, UnknownValueError
 load_dotenv()
 
 
-class WebcamStream:
+class ScreenStream:
     def __init__(self):
-        self.stream = VideoCapture(index=0)
-        _, self.frame = self.stream.read()
         self.running = False
         self.lock = Lock()
+        self.frame = None
 
     def start(self):
         if self.running:
             return self
 
         self.running = True
-
         self.thread = Thread(target=self.update, args=())
         self.thread.start()
         return self
 
     def update(self):
-        while self.running:
-            _, frame = self.stream.read()
-
-            self.lock.acquire()
-            self.frame = frame
-            self.lock.release()
+        with mss() as sct:
+            monitor = sct.monitors[1]  # Primary monitor
+            while self.running:
+                screenshot = sct.grab(monitor)
+                
+                self.lock.acquire()
+                self.frame = np.array(screenshot)
+                self.lock.release()
 
     def read(self, encode=False):
         self.lock.acquire()
-        frame = self.frame.copy()
+        frame = self.frame.copy() if self.frame is not None else np.zeros((1080, 1920, 4), dtype=np.uint8)
         self.lock.release()
+
+        # Convert from BGRA to BGR
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
         if encode:
             _, buffer = imencode(".jpeg", frame)
@@ -58,9 +62,6 @@ class WebcamStream:
         self.running = False
         if self.thread.is_alive():
             self.thread.join()
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        self.stream.release()
 
 
 class Assistant:
@@ -99,7 +100,7 @@ class Assistant:
         SYSTEM_PROMPT = """
         You are a witty assistant that will use the chat history and the image 
         provided by the user to answer its questions. Your job is to answer 
-        questions.
+        questions about what's on their screen.
 
         Use few words on your answers. Go straight to the point. Do not use any
         emoticons or emojis. 
@@ -135,12 +136,12 @@ class Assistant:
         )
 
 
-webcam_stream = WebcamStream().start()
-model = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
+screen_stream = ScreenStream().start()
+
+# Choose which model to use:
 # model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest")
-# You can use OpenAI's GPT-4o model instead of Gemini Flash
-# by uncommenting the following line:
-#model = ChatOpenAI(model="gpt-4o")
+model = ChatOpenAI(model="gpt-4o")
+#model = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
 
 assistant = Assistant(model)
 
@@ -148,7 +149,7 @@ assistant = Assistant(model)
 def audio_callback(recognizer, audio):
     try:
         prompt = recognizer.recognize_whisper(audio, model="base", language="english")
-        assistant.answer(prompt, webcam_stream.read(encode=True))
+        assistant.answer(prompt, screen_stream.read(encode=True))
 
     except UnknownValueError:
         print("There was an error processing the audio.")
@@ -160,15 +161,14 @@ with microphone as source:
     recognizer.adjust_for_ambient_noise(source)
 
 stop_listening = recognizer.listen_in_background(microphone, audio_callback)
-
 try:
     while True:
-        cv2.imshow("webcam", webcam_stream.read())
-        if cv2.waitKey(1) in [27, ord("q")]:
+        cv2.imshow("screen", screen_stream.read())
+        if cv2.waitKey(1) & 0xFF in [27, ord("q")]:
             break
 except KeyboardInterrupt:
     pass
 
-webcam_stream.stop()
+screen_stream.stop()
 cv2.destroyAllWindows()
 stop_listening(wait_for_stop=False)
